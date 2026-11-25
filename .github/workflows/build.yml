@@ -1,0 +1,153 @@
+name: Build AN758x U-Boot
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/build.yml'
+  schedule:
+    # 每 6 小时检查一次上游（GitHub 的 schedule 本身会有几分钟到几十分钟的延迟）
+    - cron: '0 */6 * * *'
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPO: https://github.com/pbs05/uboot-an758x.git
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-24.04
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      upstream_sha: ${{ steps.check.outputs.upstream_sha }}
+    steps:
+      - name: Check pbs05/uboot-an758x updates
+        id: check
+        run: |
+          UPSTREAM_SHA=$(git ls-remote "$UPSTREAM_REPO" HEAD | awk '{print $1}')
+          echo "Latest uboot-an758x HEAD: $UPSTREAM_SHA"
+          echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+
+          LAST_SHA=$(gh release list --repo "${{ github.repository }}" --limit 10 --json tagName,body \
+            | jq -r '.[] | select(.tagName | startswith("an758x-uboot-")) | .body' \
+            | grep -oE 'upstream_sha:[[:space:]]*[0-9a-f]{40}' | head -n1 | awk '{print $2}' || true)
+          echo "Last built upstream SHA: ${LAST_SHA:-none}"
+
+          if [ "${{ github.event_name }}" != "schedule" ] || [ -z "$LAST_SHA" ] || [ "$UPSTREAM_SHA" != "$LAST_SHA" ]; then
+            SHOULD_BUILD="true"
+          else
+            SHOULD_BUILD="false"
+          fi
+          echo "should_build=$SHOULD_BUILD" >> "$GITHUB_OUTPUT"
+          if [ "$SHOULD_BUILD" = "false" ]; then
+            echo "上游未更新，跳过编译。"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  build:
+    needs: check-upstream
+    if: ${{ needs.check-upstream.outputs.should_build == 'true' }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - an4475-g2
+          - hg5382a
+          - hg5585f-ct
+          - hg5585f-cu
+          - hm2004-du
+          - xg2010g
+          - xr1710g
+          - zn504xg-d
+          - zn515xg-d
+          - ung00a
+          - xg-040g-md
+          - xg-040g-tf
+          - xg-040g-mf
+    steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost /opt/pipx /usr/share/swift /usr/share/miniconda \
+            /root/.cache /tmp/* /var/tmp/* || true
+          sudo apt-get clean && sudo rm -rf /var/lib/apt/lists/* || true
+          docker system prune -af --volumes || true
+          df -h /
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison ca-certificates curl device-tree-compiler flex \
+            gcc-aarch64-linux-gnu gcc-arm-none-eabi libssl-dev \
+            python3 python3-pyelftools swig openssl
+          sudo apt-get clean && sudo rm -rf /var/lib/apt/lists/*
+
+      - name: Download Mbed TLS 3.4.1
+        run: |
+          curl -L --retry 3 \
+            https://github.com/Mbed-TLS/mbedtls/archive/refs/tags/v3.4.1.tar.gz \
+            | tar -xz -C "$RUNNER_TEMP"
+          echo "MBEDTLS_DIR=$RUNNER_TEMP/mbedtls-3.4.1" >> "$GITHUB_ENV"
+
+      - name: Clone uboot-an758x
+        run: |
+          git clone --depth=1 "$UPSTREAM_REPO" "$RUNNER_TEMP/ub"
+          git -C "$RUNNER_TEMP/ub" log -1 --oneline
+
+      - name: Build ${{ matrix.target }}
+        env:
+          CROSS_COMPILE: aarch64-linux-gnu-
+          ARM32_CROSS_COMPILE: arm-none-eabi-
+          BUILD_JOBS: 4
+        run: |
+          cd "$RUNNER_TEMP/ub"
+          # 未配置签名私钥时脚本会自动跳过签名（输出 FIP signing skipped），不影响产物
+          sh ./scripts/build-an758x.sh "${{ matrix.target }}"
+          ls -la "output/${{ matrix.target }}"
+
+      - name: Upload ${{ matrix.target }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: an758x-${{ matrix.target }}
+          path: ${{ runner.temp }}/ub/output/${{ matrix.target }}/an75*
+          if-no-files-found: error
+
+  release:
+    needs: [check-upstream, build]
+    if: always() && needs.check-upstream.outputs.should_build == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-artifacts
+
+      - name: Collect files
+        run: |
+          mkdir -p final-release
+          for dir in all-artifacts/*/; do
+            [ -d "$dir" ] || continue
+            find "$dir" -type f \( -name "*.bin" -o -name "*.fip" \) -exec cp {} final-release/ \;
+          done
+          ls -la final-release
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: an758x-uboot-v${{ github.run_number }}
+          name: AN758x U-Boot Build #${{ github.run_number }}
+          body: |
+            Automated build for pbs05/uboot-an758x
+            upstream_sha: ${{ needs.check-upstream.outputs.upstream_sha }}
+          files: final-release/*
+          fail-on-unmatched-files: false
+
+      - name: Clean up
+        if: always()
+        run: |
+          rm -rf all-artifacts final-release || true
