@@ -119,7 +119,7 @@ jobs:
 
   release:
     needs: [check-upstream, build]
-    if: always() && needs.check-upstream.outputs.should_build == 'true'
+    if: ${{ needs.check-upstream.outputs.should_build == 'true' && needs.build.result == 'success' }}
     runs-on: ubuntu-24.04
     steps:
       - name: Download all artifacts
