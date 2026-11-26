@@ -30,8 +30,9 @@ jobs:
           echo "Latest uboot-an758x HEAD: $UPSTREAM_SHA"
           echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
 
-          LAST_SHA=$(gh release list --repo "${{ github.repository }}" --limit 10 --json tagName,body \
-            | jq -r '.[] | select(.tagName | startswith("an758x-uboot-")) | .body' \
+          # 注意：gh release list 取不到 release 正文，必须走 API
+          LAST_SHA=$(gh api --paginate "repos/${{ github.repository }}/releases?per_page=30" \
+            --jq '.[] | select(.tag_name | startswith("an758x-uboot-")) | .body' 2>/dev/null \
             | grep -oE 'upstream_sha:[[:space:]]*[0-9a-f]{40}' | head -n1 | awk '{print $2}' || true)
           echo "Last built upstream SHA: ${LAST_SHA:-none}"
 
